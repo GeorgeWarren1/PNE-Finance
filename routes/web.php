@@ -11,6 +11,15 @@ Route::get('/', function () {
     return view('welcome');
 });
 
+Route::get('/transaction-list-flattened-csv', [QuickBooksReportController::class, 'exportTransactionListFlattened'])
+  ->middleware(CheckSecretHeader::class)
+ ->name('transaction.list.flattened.csv');
+
+ Route::get('/export-journal-flattened', [QuickBooksReportController::class, 'exportJournalReportFlattened'])
+  ->middleware(CheckSecretHeader::class)
+ ->name('journal.flattened.csv');
+
+
 Route::get('/balance-sheet-flattened', [QuickBooksReportController::class, 'fetchBalanceSheetFlattened'])
   ->middleware(CheckSecretHeader::class)
  ->name('balance.sheet.flattened');
@@ -33,7 +42,7 @@ Route::get('/privacy-policy', function () {
 
 Route::get('/dashboard', function () {
     return view('dashboard');
-})->middleware(['auth', 'verified'])->name('dashboard');
+})->middleware(['auth'])->name('dashboard');
 
 Route::middleware('auth')->group(function () {
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
@@ -62,5 +71,7 @@ Route::middleware('auth')->group(function () {
 
 
 });
+
+
 
 require __DIR__.'/auth.php';
