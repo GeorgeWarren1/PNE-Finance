@@ -63,7 +63,4 @@ Route::middleware('auth')->group(function () {
 
 });
 
-Route::get('/qbo/reports/{reportName}', [QuickBooksReportController::class, 'fetchReport'])->name('qbo.report');
-
-
 require __DIR__.'/auth.php';
