@@ -458,7 +458,15 @@ private function colDataToCsvRow(array $colData, int $columnCount): array
 
 public function fetchProfitAndLossDetailall(Request $request)
 {
+    set_time_limit(0);
     Log::info("Starting fetchProfitAndLossDetailall function.");
+
+    // Accept dynamic date range and chunk size, with safe defaults
+    $startDate = $request->query('start_date', '2023-01-01');
+    $endDate   = $request->query('end_date', Carbon::now()->toDateString());
+    $chunkDays = max(7, min(90, (int) $request->query('chunk_days', 30)));
+
+    Log::info("Parameters: start={$startDate}, end={$endDate}, chunk_days={$chunkDays}");
 
     // 1) Verify or refresh your QuickBooks token
     $token = QuickBooksToken::first();
@@ -468,7 +476,7 @@ public function fetchProfitAndLossDetailall(Request $request)
     }
     Log::info("QuickBooks token found.");
 
-    $realmId = Crypt::decryptString($token->realm_id);
+    $realmId     = Crypt::decryptString($token->realm_id);
     $accessToken = $token->access_token;
 
     if (Carbon::now()->greaterThan($token->expires_at)) {
@@ -477,68 +485,39 @@ public function fetchProfitAndLossDetailall(Request $request)
             Log::error("Failed to refresh QuickBooks token.");
             return response()->json(['error' => 'Failed to refresh token'], 401);
         }
-        $token = QuickBooksToken::first();
+        $token       = QuickBooksToken::first();
         $accessToken = $token->access_token;
         Log::info("QuickBooks token refreshed successfully.");
     }
 
-    $urlBase = $this->getBaseUrl()."/v3/company/{$realmId}/reports/ProfitAndLossDetail";
+    $urlBase = $this->getBaseUrl() . "/v3/company/{$realmId}/reports/ProfitAndLossDetail";
     Log::info("Base URL for QuickBooks API: " . $urlBase);
 
-    $chunks = [
-        ['start_date' => '2023-01-01', 'end_date' => '2023-06-29'],
-        ['start_date' => '2023-06-30', 'end_date' => '2023-12-31'],
-        ['start_date' => '2024-01-01', 'end_date' => '2024-04-29'],
-        ['start_date' => '2024-04-30', 'end_date' => '2024-08-31'],
-        ['start_date' => '2024-09-01', 'end_date' => '2024-12-31'],
-        ['start_date' => '2025-01-01', 'end_date' => '2025-04-29'],
-        ['start_date' => '2025-04-30', 'end_date' => '2025-08-31'],
-        ['start_date' => '2025-09-01', 'end_date' => '2025-12-31'],
-        ['start_date' => '2026-01-01', 'end_date' => '2026-04-29'],
-        ['start_date' => '2026-04-30', 'end_date' => '2026-08-31'],
-        ['start_date' => '2026-09-01', 'end_date' => '2026-12-31'],
-    ];
-
-    Log::info("Processing " . count($chunks) . " chunks.");
+    $chunks = $this->generateDateChunks($startDate, $endDate, $chunkDays);
+    Log::info("Processing " . count($chunks) . " chunks of {$chunkDays} days each.");
 
     $allFlattenedRows = [];
-    $headerTitles = [];
-    $columnCount  = 0;
+    $headerTitles     = [];
+    $columnCount      = 0;
 
     foreach ($chunks as $chunk) {
-        Log::info("Fetching data for chunk: " . $chunk['start_date'] . " to " . $chunk['end_date']);
+        Log::info("Fetching chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
+        $chunkStart = microtime(true);
 
-        $startTime = microtime(true);
+        $reportJsonData = $this->fetchChunkWithRetry($urlBase, $accessToken, $chunk, $chunkDays);
 
-        $response = Http::withHeaders([
-            'Authorization' => 'Bearer ' . $accessToken,
-            'Accept'        => 'application/json'
-        ])->get($urlBase, [
-            'start_date' => $chunk['start_date'],
-            'end_date'   => $chunk['end_date'],
-        ]);
-
-        if ($response->failed()) {
-            Log::error("Failed to fetch P&L Detail for " . $chunk['start_date'] . " - " . $chunk['end_date'], [
-                'status' => $response->status(),
-                'error'  => $response->json(),
-            ]);
+        if ($reportJsonData === null) {
             return response()->json([
-                'error'   => 'Failed to fetch P&L Detail',
-                'details' => $response->json(),
+                'error'   => 'Failed to fetch P&L Detail for chunk ' . $chunk['start_date'] . ' to ' . $chunk['end_date'],
+                'details' => 'Chunk failed after retry with smaller date range. Check logs for details.',
             ], 400);
         }
 
-        $reportJsonData = $response->json();
-        Log::info("Successfully fetched data for chunk: " . $chunk['start_date'] . " to " . $chunk['end_date']);
-
-        // Grab column headers if we haven't yet
-        if (!$headerTitles) {
-            $columns = $reportJsonData['Columns']['Column'] ?? [];
+        // Grab column headers once
+        if (empty($headerTitles)) {
+            $columns     = $reportJsonData['Columns']['Column'] ?? [];
             $columnCount = count($columns);
-            $headerTitles = array_map(function ($col) {
-                return $col['ColTitle'] ?? '';
-            }, $columns);
+            $headerTitles = array_map(fn($col) => $col['ColTitle'] ?? '', $columns);
             Log::info("Extracted column headers: " . implode(', ', $headerTitles));
         }
 
@@ -547,49 +526,63 @@ public function fetchProfitAndLossDetailall(Request $request)
             $flattened = [];
             $this->flattenAllRows($reportJsonData['Rows']['Row'], $flattened, $columnCount);
 
-            // Remove newlines in all fields of the flattened rows
             foreach ($flattened as &$flatRow) {
                 foreach ($flatRow as &$field) {
-                    $field = str_replace(["\r", "\n"], " ", $field);
+                    $field = str_replace(["\r", "\n"], ' ', $field);
                 }
             }
+            unset($flatRow, $field);
 
             $allFlattenedRows = array_merge($allFlattenedRows, $flattened);
-
-            Log::info("Processed " . count($flattened) . " rows for chunk: " . $chunk['start_date'] . " to " . $chunk['end_date']);
+            Log::info("Processed " . count($flattened) . " rows for chunk " . $chunk['start_date'] . " -> " . $chunk['end_date']);
         } else {
-            Log::warning("No data found for chunk: " . $chunk['start_date'] . " to " . $chunk['end_date']);
+            Log::warning("No rows returned for chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
         }
 
-        $endTime = microtime(true);
-        $executionTime = round($endTime - $startTime, 2);
-        Log::info("Chunk " . $chunk['start_date'] . " - " . $chunk['end_date'] . " took {$executionTime} seconds to process.");
+        $elapsed = round(microtime(true) - $chunkStart, 2);
+        Log::info("Chunk took {$elapsed}s.");
     }
 
-    Log::info("Total flattened rows collected: " . count($allFlattenedRows));
+    Log::info("Total rows collected: " . count($allFlattenedRows));
 
-    $filename = "Profit_and_Loss_AllData.csv";
-    $headers  = [
+    $filename   = "Profit_and_Loss_AllData.csv";
+    $csvHeaders = [
         'Content-Type'        => 'text/csv',
-        'Content-Disposition' => "attachment; filename=\"$filename\"",
+        'Content-Disposition' => "attachment; filename=\"{$filename}\"",
     ];
-
-    Log::info("Generating CSV file with " . count($allFlattenedRows) . " rows.");
 
     return response()->stream(function () use ($headerTitles, $allFlattenedRows) {
         $file = fopen('php://output', 'w');
-
         fputcsv($file, $headerTitles);
-
         foreach ($allFlattenedRows as $row) {
             fputcsv($file, $row);
         }
-
         fclose($file);
-    }, 200, $headers);
+    }, 200, $csvHeaders);
 }
 
 
+/**
+ * Generates an array of date-range chunks between $startDate and $endDate,
+ * each spanning at most $chunkDays days. The final chunk is clamped to $endDate.
+ */
+private function generateDateChunks(string $startDate, string $endDate, int $chunkDays): array
+{
+    $chunks  = [];
+    $current = Carbon::parse($startDate);
+    $end     = Carbon::parse($endDate);
+
+    while ($current->lte($end)) {
+        $chunkEnd = $current->copy()->addDays($chunkDays - 1);
+        if ($chunkEnd->gt($end)) {
+            $chunkEnd = $end->copy();
+        }
+        $chunks[] = [
+            'start_date' => $current->toDateString(),
+            'end_date'   => $chunkEnd->toDateString(),
+        ];
+        $current->addDays($chunkDays);
+    }
 
     /**
      * ========= NEW: TransactionList CSV (flattened like Balance Sheet) =========
@@ -732,6 +725,8 @@ public function fetchProfitAndLossDetailall(Request $request)
 
         foreach ($rowsNode['Row'] as $node) {
             $currentHierarchy = $hierarchy;
+    return $chunks;
+}
 
             // Section header → extend hierarchy with first ColData value
             if (isset($node['Header']['ColData'][0]['value']) && $node['Header']['ColData'][0]['value'] !== '') {
@@ -774,11 +769,69 @@ public function fetchProfitAndLossDetailall(Request $request)
         }
         return array_slice($levels, 0, $n);
     }
+/**
+ * Fetches a single P&L chunk from the QBO API.
+ * On failure, splits the chunk in half and retries each sub-chunk after a 2-second pause.
+ * Returns the merged report JSON on success, or null if all retries fail.
+ */
+private function fetchChunkWithRetry(string $url, string $accessToken, array $chunk, int $chunkDays): ?array
+{
+    $response = Http::withHeaders([
+        'Authorization' => 'Bearer ' . $accessToken,
+        'Accept'        => 'application/json',
+    ])->get($url, [
+        'start_date' => $chunk['start_date'],
+        'end_date'   => $chunk['end_date'],
+    ]);
 
+    if ($response->successful()) {
+        return $response->json();
+    }
 
+    Log::warning(
+        "Chunk {$chunk['start_date']} – {$chunk['end_date']} failed (HTTP {$response->status()}). "
+        . "Retrying with half-size sub-chunks."
+    );
 
+    $halfDays  = max(7, (int) ceil($chunkDays / 2));
+    $subChunks = $this->generateDateChunks($chunk['start_date'], $chunk['end_date'], $halfDays);
 
+    $mergedData = null;
 
+    foreach ($subChunks as $sub) {
+        sleep(2);
+
+        $subResponse = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $accessToken,
+            'Accept'        => 'application/json',
+        ])->get($url, [
+            'start_date' => $sub['start_date'],
+            'end_date'   => $sub['end_date'],
+        ]);
+
+        if ($subResponse->failed()) {
+            Log::error(
+                "Sub-chunk {$sub['start_date']} – {$sub['end_date']} also failed (HTTP {$subResponse->status()}).",
+                ['details' => $subResponse->json()]
+            );
+            return null;
+        }
+
+        $subData = $subResponse->json();
+
+        if ($mergedData === null) {
+            $mergedData = $subData;
+        } else {
+            // Append rows from subsequent sub-chunks into the merged result
+            $newRows = $subData['Rows']['Row'] ?? [];
+            if (!empty($newRows)) {
+                $mergedData['Rows']['Row'] = array_merge(
+                    $mergedData['Rows']['Row'] ?? [],
+                    $newRows
+                );
+            }
+        }
+    }
 
  /**
      * ========= NEW: JournalReport CSV (flattened like TransactionList) =========
@@ -971,6 +1024,8 @@ public function fetchProfitAndLossDetailall(Request $request)
 
 
 
+    return $mergedData;
+}
 
 
 }
